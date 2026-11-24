@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-14
     timeout-minutes: 330
     steps:
       - name: Build files
@@ -44,6 +44,8 @@ jobs:
 
       - name: Tools
         run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1); [ -n "$X" ] && sudo xcode-select -s "$X" || true
           brew install ninja ccache git-lfs || true
           git lfs install
           sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
