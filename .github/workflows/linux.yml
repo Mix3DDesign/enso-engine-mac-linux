@@ -15,8 +15,50 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  libs:
+    name: libraries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    steps:
+      - name: Source
+        uses: actions/checkout@v4
+        with:
+          repository: Mix3DDesign/enso-engine
+          ref: enso-engine
+          path: src
+          fetch-depth: 1
+          lfs: false
+
+      - name: Which libraries
+        id: key
+        working-directory: src
+        run: echo "key=libs-linux-$(git ls-tree HEAD lib/linux_x64 | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Kept copy
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: src/lib/linux_x64
+          key: ${{ steps.key.outputs.key }}
+
+      - name: Download from Blender's server (only when there is no kept copy)
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: src
+        run: |
+          ok=0
+          for n in 1 2 3; do
+            if python3 build_files/utils/make_update.py --no-blender --use-linux-libraries > ../libs_log.txt 2>&1; then ok=1; break; fi
+            echo "libraries: try $n failed"; tail -5 ../libs_log.txt; sleep 40
+          done
+          [ "$ok" = 1 ] || { tail -40 ../libs_log.txt; exit 1; }
+          rm -f lib/linux_x64/.git
+          du -sh lib/linux_x64
+
   part:
     name: ${{ matrix.part }}
+    needs: libs
     runs-on: ubuntu-24.04
     timeout-minutes: 345
     strategy:
@@ -83,24 +125,18 @@ jobs:
         working-directory: src
         run: |
           git lfs install
+          git lfs pull --exclude="tests/**" || true
           git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
-          for n in 1 2 3 4 5; do git lfs pull --exclude="tests/**" && break; echo "Blender's server said no, try $n"; sleep $((n * 45)); done
+          for n in 1 2 3 4; do git lfs pull --exclude="tests/**" && break; echo "Blender's server said no, try $n"; sleep $((n * 30)); done
           git config --unset lfs.url
-          for n in 1 2 3; do git lfs pull --exclude="tests/**" && break; sleep 30; done
+          git lfs pull --exclude="tests/**"
 
       - name: Libraries
-        working-directory: src
-        run: |
-          # Blender's server sometimes refuses many machines at once: wait a little and try again.
-          sleep $(( RANDOM % 40 ))
-          ok=0
-          for n in 1 2 3 4 5 6; do
-            if python3 build_files/utils/make_update.py --no-blender --use-linux-libraries > ../libs_log.txt 2>&1; then ok=1; break; fi
-            echo "libraries: try $n failed"; tail -5 ../libs_log.txt; sleep $((n * 60))
-          done
-          [ "$ok" = 1 ] || { tail -40 ../libs_log.txt; exit 1; }
-          du -sh lib/linux_x64 || true
-          df -h /
+        uses: actions/cache/restore@v4
+        with:
+          path: src/lib/linux_x64
+          key: ${{ needs.libs.outputs.key }}
+          fail-on-cache-miss: true
 
       - name: Compiler cache
         if: matrix.kind == 'main'
