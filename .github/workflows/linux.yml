@@ -84,14 +84,21 @@ jobs:
         run: |
           git lfs install
           git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
-          git lfs pull --exclude="tests/**" || true
+          for n in 1 2 3 4 5; do git lfs pull --exclude="tests/**" && break; echo "Blender's server said no, try $n"; sleep $((n * 45)); done
           git config --unset lfs.url
-          git lfs pull --exclude="tests/**"
+          for n in 1 2 3; do git lfs pull --exclude="tests/**" && break; sleep 30; done
 
       - name: Libraries
         working-directory: src
         run: |
-          python3 build_files/utils/make_update.py --no-blender --use-linux-libraries > ../libs_log.txt 2>&1 || { tail -40 ../libs_log.txt; exit 1; }
+          # Blender's server sometimes refuses many machines at once: wait a little and try again.
+          sleep $(( RANDOM % 40 ))
+          ok=0
+          for n in 1 2 3 4 5 6; do
+            if python3 build_files/utils/make_update.py --no-blender --use-linux-libraries > ../libs_log.txt 2>&1; then ok=1; break; fi
+            echo "libraries: try $n failed"; tail -5 ../libs_log.txt; sleep $((n * 60))
+          done
+          [ "$ok" = 1 ] || { tail -40 ../libs_log.txt; exit 1; }
           du -sh lib/linux_x64 || true
           df -h /
 
