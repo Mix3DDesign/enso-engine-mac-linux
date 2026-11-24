@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Enso Engine
+GenericName=Anime and NPR 3D
+Comment=Anime and NPR rendering, built into Blender
+Keywords=3d;anime;npr;toon;cel;modeling;animation;rendering;blender;
+Exec=enso-engine %f
+Icon=enso-engine
+Terminal=false
+Type=Application
+PrefersNonDefaultGPU=true
+Categories=Graphics;3DGraphics;
+StartupWMClass=enso-engine

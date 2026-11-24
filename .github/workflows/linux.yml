@@ -1,0 +1,234 @@
+name: Linux build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/linux.yml
+      - patches/**
+      - files/**
+      - linux/**
+  workflow_dispatch:
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  part:
+    name: ${{ matrix.part }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - part: engine
+            kind: main
+          - part: nvidia-cuda
+            kind: nvidia
+            targets: cycles_kernel_cuda
+          - part: nvidia-optix
+            kind: nvidia
+            targets: cycles_kernel_optix
+          - part: amd-1
+            kind: amd
+            targets: cycles_kernel_hip cycles_kernel_hiprt
+            archs: gfx1010;gfx1011;gfx1012;gfx1030;gfx1031
+          - part: amd-2
+            kind: amd
+            targets: cycles_kernel_hip cycles_kernel_hiprt
+            archs: gfx1032;gfx1034;gfx1035;gfx1036;gfx1100
+          - part: amd-3
+            kind: amd
+            targets: cycles_kernel_hip cycles_kernel_hiprt
+            archs: gfx1101;gfx1102;gfx1103;gfx1150;gfx1151
+          - part: amd-4
+            kind: amd
+            targets: cycles_kernel_hip cycles_kernel_hiprt
+            archs: gfx1152;gfx1153;gfx1200;gfx1201
+    steps:
+      - name: Build files
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Source
+        uses: actions/checkout@v4
+        with:
+          repository: Mix3DDesign/enso-engine
+          ref: enso-engine
+          path: src
+          fetch-depth: 1
+          lfs: false
+
+      - name: Changes that are not published yet
+        working-directory: src
+        run: |
+          for p in ../ci/patches/*.patch; do
+            echo "applying $p"
+            GIT_LFS_SKIP_SMUDGE=1 git apply --whitespace=nowarn "$p"
+          done
+          if [ -d ../ci/files ]; then cp -R ../ci/files/. .; fi
+
+      - name: Room and memory
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/.ghcup || true
+          sudo docker image prune -a -f > /dev/null || true
+          sudo fallocate -l 10G /extra_swap && sudo chmod 600 /extra_swap && sudo mkswap /extra_swap > /dev/null && sudo swapon /extra_swap || true
+          nproc; free -g; df -h /
+
+      - name: Large files of the source (not the tests)
+        if: matrix.kind == 'main'
+        working-directory: src
+        run: |
+          git lfs install
+          git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
+          git lfs pull --exclude="tests/**" || true
+          git config --unset lfs.url
+          git lfs pull --exclude="tests/**"
+
+      - name: Libraries
+        working-directory: src
+        run: |
+          python3 build_files/utils/make_update.py --no-blender --use-linux-libraries > ../libs_log.txt 2>&1 || { tail -40 ../libs_log.txt; exit 1; }
+          du -sh lib/linux_x64 || true
+          df -h /
+
+      - name: Compiler cache
+        if: matrix.kind == 'main'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-rocky8-${{ github.run_id }}
+          restore-keys: ccache-rocky8-
+
+      - name: Build on an older system, so it runs on more computers
+        run: |
+          mkdir -p "$HOME/.cache/ccache"
+          docker run --rm -v "$GITHUB_WORKSPACE:/w" -v "$HOME/.cache/ccache:/ccache" \
+            -e CCACHE_DIR=/ccache -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -e KIND="${{ matrix.kind }}" -e TARGETS="${{ matrix.targets }}" -e HIP_ARCHS="${{ matrix.archs }}" \
+            rockylinux:8 bash /w/ci/linux/build_in_rocky8.sh
+
+      - name: Keep the engine for packing
+        if: matrix.kind == 'main'
+        run: |
+          tar -C build -cf - bin | zstd -T0 -6 -o "$RUNNER_TEMP/engine.tar.zst"
+          ls -la "$RUNNER_TEMP/engine.tar.zst"
+
+      - name: Upload engine
+        if: matrix.kind == 'main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: part-engine
+          retention-days: 3
+          compression-level: 0
+          path: ${{ runner.temp }}/engine.tar.zst
+
+      - name: Upload kernels
+        if: matrix.kind != 'main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: part-${{ matrix.part }}
+          retention-days: 3
+          path: kernels/
+
+      - name: Keep the log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ matrix.part }}
+          retention-days: 3
+          path: |
+            build_log.txt
+            configure_log.txt
+
+  pack:
+    needs: part
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Build files
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Get the parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: part-*
+          path: parts
+
+      - name: Put them together
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd imagemagick xvfb libgl1-mesa-dri libegl1 libglx-mesa0 mesa-vulkan-drivers libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6 > /dev/null
+          D=EnsoEngine-1.2.1-linux-x64
+          zstd -dc parts/part-engine/engine.tar.zst | tar -xf -
+          mv bin "$D"
+          K="$D/5.3/scripts/addons_core/cycles/lib"
+          mkdir -p "$K"
+          for p in parts/part-nvidia-* parts/part-amd-*; do
+            echo "$p: $(ls "$p" | wc -l) files"
+            cp "$p"/kernel_*.zst "$K"/
+          done
+          echo "CYCLES GPU KERNELS"
+          ls "$K" | sed -E 's/gfx1[0-9]+/gfxN/; s/sm_[0-9]+/sm_N/' | sort | uniq -c
+          echo "TOTAL $(ls "$K" | wc -l) files, $(du -sh "$K" | cut -f1)"
+          echo "MISSING AMD CARDS:"; for a in gfx1010 gfx1011 gfx1012 gfx1030 gfx1031 gfx1032 gfx1034 gfx1035 gfx1036 gfx1100 gfx1101 gfx1102 gfx1103 gfx1150 gfx1151 gfx1152 gfx1153 gfx1200 gfx1201; do
+            [ -f "$K/kernel_$a.fatbin.zst" ] || echo "  HIP $a"; [ -f "$K/kernel_rt_$a.hipfb.zst" ] || echo "  HIP RT $a"; done
+          echo "MISSING NVIDIA CARDS:"; for a in sm_50 sm_52 sm_60 sm_70 sm_75 sm_86 sm_120; do [ -f "$K/kernel_$a.cubin.zst" ] || echo "  CUDA $a"; done
+          [ -f "$K/kernel_compute_75.ptx.zst" ] || echo "  CUDA compute_75"
+          [ -f "$K/kernel_optix.ptx.zst" ] || echo "  OPTIX"
+
+      - name: Try it
+        run: |
+          D=EnsoEngine-1.2.1-linux-x64
+          cat > "$RUNNER_TEMP/smoke.py" <<'PY'
+          import bpy, os
+          print("ENSO VERSION", getattr(bpy.app, "enso_version_string", "?"))
+          print("ENSO SHADER NODES", len([n for n in dir(bpy.types) if n.startswith("ShaderNodeEnso")]))
+          import _cycles
+          print("CYCLES DEVICE TYPES BUILT IN", _cycles.get_device_types())
+          p = bpy.context.preferences.addons["cycles"].preferences
+          for t in ("CUDA", "OPTIX", "HIP", "ONEAPI"):
+              try:
+                  p.compute_device_type = t
+                  print("CYCLES CAN SELECT", t)
+              except Exception as ex:
+                  print("CYCLES CANNOT SELECT", t, ex)
+          bpy.ops.wm.read_factory_settings(use_empty=False)
+          sc = bpy.context.scene
+          sc.render.engine = 'CYCLES'
+          sc.cycles.samples = 4
+          sc.render.resolution_x = 320
+          sc.render.resolution_y = 180
+          sc.render.filepath = os.path.join(os.environ["RUNNER_TEMP"], "cycles_cpu.png")
+          bpy.ops.render.render(write_still=True)
+          print("CYCLES CPU RENDER OK", os.path.exists(sc.render.filepath))
+          PY
+          LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a "./$D/blender" -b --python "$RUNNER_TEMP/smoke.py" 2>&1 | grep -E "ENSO|CYCLES|rror" | head -40
+
+      - name: Pack
+        run: |
+          D=EnsoEngine-1.2.1-linux-x64
+          rm -f "$D"/datatoc "$D"/makesdna "$D"/makesrna "$D"/msgfmt "$D"/shader_tool "$D"/zstd_compress
+          rm -f "$D"/blender.desktop "$D"/blender.svg "$D"/blender-symbolic.svg
+          cp ci/linux/package/enso-engine.desktop ci/linux/package/README-LINUX.txt "$D"/
+          cp ci/linux/package/add-to-menu.sh ci/linux/package/remove-from-menu.sh "$D"/
+          chmod +x "$D"/add-to-menu.sh "$D"/remove-from-menu.sh
+          convert ci/branding/enso_icon_1024.png -resize 256x256 "$D"/enso-engine.png
+          ln -sf blender "$D"/enso-engine
+          echo "NEEDS GLIBC $(objdump -T "$D"/blender | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          echo "NEEDS GLIBCXX $(objdump -T "$D"/blender | grep -o 'GLIBCXX_[0-9.]*' | sort -uV | tail -1)"
+          tar -cf - "$D" | xz -T0 -6 > "$RUNNER_TEMP/EnsoEngine-1.2.1-linux-x64.tar.xz"
+          ls -la "$RUNNER_TEMP"
+
+      - name: Keep the build
+        uses: actions/upload-artifact@v4
+        with:
+          name: EnsoEngine-linux-x64
+          retention-days: 5
+          compression-level: 0
+          path: ${{ runner.temp }}/EnsoEngine-1.2.1-linux-x64.tar.xz
